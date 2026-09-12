@@ -212,3 +212,16 @@ async def test_document_tools_report_unconfigured(monkeypatch):
     monkeypatch.setattr(config.settings, "database_url", "")
     with pytest.raises(Exception, match="MCP_DATABASE_URL"):
         await mcp.call_tool("search_documents", {"query": "anything"})
+
+
+def test_as_dict_handles_both_dict_and_json_string():
+    """JSONB arrives as a dict with the codec and as text without it; spreading
+    a string raises where the model only sees 'Error executing tool'."""
+    from mcp_server.db import as_dict
+
+    assert as_dict({"a": 1}) == {"a": 1}
+    assert as_dict('{"a": 1}') == {"a": 1}
+    assert as_dict(None) == {}
+    assert as_dict("") == {}
+    assert as_dict("not json") == {}
+    assert as_dict("[1,2]") == {}  # valid JSON, wrong shape

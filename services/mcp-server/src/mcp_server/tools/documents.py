@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from .. import db
 from ..config import settings
+from ..db import as_dict
 from ..ingest import embed_query
 
 logger = logging.getLogger(__name__)
@@ -114,7 +115,7 @@ def register(mcp: MCPServer) -> None:
                     text=r["text"],
                     score=float(r["score"]),
                     similarity=float(r["similarity"]) if r["similarity"] is not None else None,
-                    metadata={**(r["doc_metadata"] or {}), **(r["chunk_metadata"] or {})},
+                    metadata={**as_dict(r["doc_metadata"]), **as_dict(r["chunk_metadata"])},
                 )
                 for r in rows
             ],
@@ -158,7 +159,7 @@ def register(mcp: MCPServer) -> None:
                 content_type=r["content_type"],
                 page_count=r["page_count"],
                 chunk_count=r["chunk_count"],
-                metadata=r["metadata"] or {},
+                metadata=as_dict(r["metadata"]),
                 created_at=r["created_at"].isoformat(),
             )
             for r in rows

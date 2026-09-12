@@ -103,6 +103,25 @@ async def init_schema() -> None:
     logger.info("schema applied")
 
 
+def as_dict(value: Any) -> dict[str, Any]:
+    """Coerce a JSONB column to a dict.
+
+    The pool registers a jsonb codec, but a connection that misses it returns
+    raw text, and spreading a string raises deep inside a tool where the model
+    only sees "Error executing tool". Cheap here, and it cannot regress.
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            logger.warning("metadata column was not valid JSON: %.60s", value)
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 def to_vector_literal(embedding: list[float]) -> str:
     """pgvector's text input format. asyncpg has no codec for the vector type,
     so values cross the wire as strings and are cast with `$n::vector`."""
