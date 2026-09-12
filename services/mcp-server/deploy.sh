@@ -12,6 +12,9 @@ PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
 REGION="${REGION:-us-central1}"
 SERVICE="${SERVICE:-mcp-server}"
 SECRET_NAME="${SECRET_NAME:-mcp-auth-token}"
+# Non-secret configuration; overridable per deploy.
+EMBEDDING_BASE_URL="${EMBEDDING_BASE_URL:-https://openrouter.ai/api/v1}"
+EMBEDDING_MODEL="${EMBEDDING_MODEL:-openai/text-embedding-3-small}"
 
 if [[ -z "${PROJECT_ID}" || "${PROJECT_ID}" == "(unset)" ]]; then
   echo "PROJECT_ID is not set. Run: gcloud config set project <id>" >&2
@@ -53,14 +56,61 @@ if ! gcloud secrets describe "${SECRET_NAME}" --project="${PROJECT_ID}" >/dev/nu
     --data-file=- --project="${PROJECT_ID}"
 fi
 
+# Seed a secret from the matching key in the local .env, if it is not already in
+# Secret Manager. Existing secrets are left alone; rotate them with
+# `gcloud secrets versions add` rather than here.
+seed_secret_from_env() {
+  local secret="$1" env_key="$2"
+  if gcloud secrets describe "${secret}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    echo "    ${secret}: already exists, leaving it"
+    return 0
+  fi
+  if [[ ! -f .env ]]; then
+    echo "    ${secret}: no .env to read ${env_key} from — skipping" >&2
+    return 1
+  fi
+  # python, not shell: these values contain & and other shell metacharacters.
+  local tmp
+  tmp="$(mktemp)"
+  python3 -c "
+import pathlib, re, sys
+m = re.search(r'^${env_key}=(.*)\$', pathlib.Path('.env').read_text(), re.M)
+v = (m.group(1).strip() if m else '')
+sys.exit(1) if not v else pathlib.Path('${tmp}').write_text(v)
+" || { echo "    ${secret}: ${env_key} is empty in .env — skipping"; rm -f "${tmp}"; return 1; }
+  gcloud secrets create "${secret}" --replication-policy=automatic --project="${PROJECT_ID}" >/dev/null
+  gcloud secrets versions add "${secret}" --data-file="${tmp}" --project="${PROJECT_ID}" >/dev/null
+  rm -f "${tmp}"
+  echo "    ${secret}: created from ${env_key}"
+}
+
+echo "==> Ensuring retrieval secrets exist"
+seed_secret_from_env "mcp-database-url" "MCP_DATABASE_URL" || true
+seed_secret_from_env "mcp-openai-api-key" "MCP_OPENAI_API_KEY" || true
+seed_secret_from_env "mcp-tavily-api-key" "MCP_TAVILY_API_KEY" || true
+
 PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
 RUNTIME_SA="${RUNTIME_SA:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
 
-echo "==> Granting ${RUNTIME_SA} access to ${SECRET_NAME}"
-gcloud secrets add-iam-policy-binding "${SECRET_NAME}" \
-  --member="serviceAccount:${RUNTIME_SA}" \
-  --role=roles/secretmanager.secretAccessor \
-  --project="${PROJECT_ID}" >/dev/null
+echo "==> Granting ${RUNTIME_SA} access to the secrets"
+for secret in "${SECRET_NAME}" mcp-database-url mcp-openai-api-key mcp-tavily-api-key; do
+  gcloud secrets describe "${secret}" --project="${PROJECT_ID}" >/dev/null 2>&1 || continue
+  gcloud secrets add-iam-policy-binding "${secret}" \
+    --member="serviceAccount:${RUNTIME_SA}" \
+    --role=roles/secretmanager.secretAccessor \
+    --project="${PROJECT_ID}" >/dev/null
+  echo "    ${secret}"
+done
+
+# Only mount secrets that actually exist, so a partial setup still deploys.
+SECRET_MOUNTS="MCP_AUTH_TOKEN=${SECRET_NAME}:latest"
+for pair in "MCP_DATABASE_URL=mcp-database-url" "MCP_OPENAI_API_KEY=mcp-openai-api-key" \
+            "MCP_TAVILY_API_KEY=mcp-tavily-api-key"; do
+  secret="${pair#*=}"
+  if gcloud secrets describe "${secret}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    SECRET_MOUNTS="${SECRET_MOUNTS},${pair}:latest"
+  fi
+done
 
 echo "==> Deploying"
 # --allow-unauthenticated is deliberate: MCP clients can't mint Google ID
@@ -71,8 +121,8 @@ gcloud run deploy "${SERVICE}" \
   --project="${PROJECT_ID}" \
   --platform=managed \
   --allow-unauthenticated \
-  --set-secrets="MCP_AUTH_TOKEN=${SECRET_NAME}:latest" \
-  --set-env-vars="MCP_SERVER_NAME=${SERVICE},MCP_LOG_LEVEL=info" \
+  --set-secrets="${SECRET_MOUNTS}" \
+  --set-env-vars="MCP_SERVER_NAME=${SERVICE},MCP_LOG_LEVEL=info,MCP_OPENAI_BASE_URL=${EMBEDDING_BASE_URL},MCP_EMBEDDING_MODEL=${EMBEDDING_MODEL}" \
   --cpu=1 \
   --memory=512Mi \
   --min-instances=0 \
@@ -84,4 +134,5 @@ URL="$(gcloud run services describe "${SERVICE}" --region="${REGION}" \
 
 echo
 echo "Deployed: ${URL}/mcp"
+echo "Health:   curl -s ${URL}/health"
 echo "Token:    gcloud secrets versions access latest --secret=${SECRET_NAME} --project=${PROJECT_ID}"
